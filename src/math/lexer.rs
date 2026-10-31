@@ -1,3 +1,5 @@
+use std::fmt;
+
 #[derive(Debug)]
 pub enum TokenType {
     // Literals
@@ -37,7 +39,32 @@ pub struct Lexer<'a> {
     current_char: Option<char>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum LexError {
+    /// 遇到了无法识别的字符
+    UnexpectedCharacter { ch: char, position: usize },
+    /// 数字字面量无法解析为 f64（例如溢出）
+    InvalidNumber {
+        text: String,
+        start: usize,
+        end: usize,
+    },
+}
 
+impl fmt::Display for LexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LexError::UnexpectedCharacter { ch, position } => {
+                write!(f, "unexpected character '{}' at position {}", ch, position)
+            }
+            LexError::InvalidNumber { text, start, end } => {
+                write!(f, "invalid number literal '{}' at {}..{}", text, start, end)
+            }
+        }
+    }
+}
+
+impl std::error::Error for LexError {}
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
         let mut lexer = Lexer {
@@ -71,17 +98,13 @@ impl<'a> Lexer<'a> {
         self.input[self.position + c.len_utf8()..].chars().next()
     }
 
-    fn number(&mut self) -> TokenType {
-        let start = self.position;
+    fn number(&mut self, start: usize) -> Result<TokenType, LexError> {
         let mut seen_dot = false;
 
         while let Some(c) = self.current_char {
             if c.is_ascii_digit() {
                 self.advance();
-            } else if c == '.'
-                && !seen_dot
-                && self.peek().map_or(false, |n| n.is_ascii_digit())
-            {
+            } else if c == '.' && !seen_dot && self.peek().map_or(false, |n| n.is_ascii_digit()) {
                 seen_dot = true;
                 self.advance();
             } else {
@@ -89,13 +112,19 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        let text = &self.input[start..self.position];
-        TokenType::Number(text.parse().expect("Invalid number literal"))
+        let end = self.position;
+        let text = &self.input[start..end];
+
+        text.parse::<f64>()
+            .map(TokenType::Number)
+            .map_err(|_| LexError::InvalidNumber {
+                text: text.to_string(),
+                start,
+                end,
+            })
     }
 
-    fn identifier(&mut self) -> TokenType {
-        let start = self.position;
-
+    fn identifier(&mut self, start: usize) -> TokenType {
         while let Some(c) = self.current_char {
             if c.is_alphanumeric() || c == '_' {
                 self.advance();
@@ -103,11 +132,10 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-
         TokenType::Identifier(self.input[start..self.position].to_string())
     }
 
-    pub fn next_token(&mut self) -> Token {
+    pub fn next_token(&mut self) -> Result<Token, LexError> {
         self.skip_whitespace();
 
         let start = self.position;
@@ -155,30 +183,34 @@ impl<'a> Lexer<'a> {
                 }
 
                 c if c.is_ascii_digit()
-                    || (c == '.'
-                        && self.peek().map_or(false, |n| n.is_ascii_digit())) =>
+                    || (c == '.' && self.peek().map_or(false, |n| n.is_ascii_digit())) =>
                 {
-                    self.number()
+                    self.number(start)?
                 }
 
-                c if c.is_alphabetic() || c == '_' => self.identifier(),
+                c if c.is_alphabetic() || c == '_' => self.identifier(start),
 
-                _ => panic!("Unexpected character: '{}'", c),
+                _ => {
+                    return Err(LexError::UnexpectedCharacter {
+                        ch: c,
+                        position: start,
+                    });
+                }
             },
         };
 
-        Token {
+        Ok(Token {
             token_type,
             start,
             end: self.position,
-        }
+        })
     }
 
-    pub fn tokenize(mut self) -> Vec<Token> {
+    pub fn tokenize(mut self) -> Result<Vec<Token>, LexError> {
         let mut tokens = Vec::new();
 
         loop {
-            let token = self.next_token();
+            let token = self.next_token()?;
             let is_eof = matches!(token.token_type, TokenType::EOF);
             tokens.push(token);
 
@@ -187,6 +219,6 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        tokens
+        Ok(tokens)
     }
 }

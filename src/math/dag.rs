@@ -148,6 +148,72 @@ impl Graph {
 
         result
     }
+
+    /// 从 root 做一次可达性分析，剔除不可达节点并重新编号，
+    /// 使 `nodes` 紧凑、id 连续。
+    ///
+    /// 依赖 `GraphBuilder` 始终 append 新节点的性质：
+    /// 子节点的旧 id 一定小于父节点，因此按旧 id 递增遍历时，
+    /// 父节点可达则其所有子节点也必已可达、`remap` 已填充。
+    fn eliminate_dead_nodes(self) -> Graph {
+        let mut reachable = vec![false; self.nodes.len()];
+        let mut stack = vec![self.root];
+
+        while let Some(id) = stack.pop() {
+            if reachable[id] {
+                continue;
+            }
+
+            reachable[id] = true;
+
+            if let Some(deps) = self.dependencies(id) {
+                for dep in deps {
+                    if !reachable[dep] {
+                        stack.push(dep);
+                    }
+                }
+            }
+        }
+
+        let Graph { nodes, root } = self;
+        let len = nodes.len();
+
+        let mut remap = vec![usize::MAX; len];
+        let mut new_nodes = Vec::with_capacity(len);
+
+        for (old_id, node) in nodes.into_iter().enumerate() {
+            if !reachable[old_id] {
+                continue;
+            }
+
+            let new_id = new_nodes.len();
+            remap[old_id] = new_id;
+
+            let kind = match node.kind {
+                NodeKind::Constant(value) => NodeKind::Constant(value),
+
+                NodeKind::Variable(name) => NodeKind::Variable(name),
+
+                NodeKind::Unary { op, input } => NodeKind::Unary {
+                    op,
+                    input: remap[input],
+                },
+
+                NodeKind::Binary { op, lhs, rhs } => NodeKind::Binary {
+                    op,
+                    lhs: remap[lhs],
+                    rhs: remap[rhs],
+                },
+            };
+
+            new_nodes.push(Node { id: new_id, kind });
+        }
+
+        Graph {
+            nodes: new_nodes,
+            root: remap[root],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -206,6 +272,17 @@ impl GraphBuilder {
         }
     }
 
+    /// 如果 `id` 是 `Neg(x)`，返回 `Some(x)`。
+    fn neg_inner(&self, id: NodeId) -> Option<NodeId> {
+        match &self.nodes.get(id)?.kind {
+            NodeKind::Unary {
+                op: UnaryOp::Neg,
+                input,
+            } => Some(*input),
+            _ => None,
+        }
+    }
+
     pub fn variable(&mut self, name: impl Into<String>) -> NodeId {
         let name = name.into();
 
@@ -223,6 +300,7 @@ impl GraphBuilder {
     pub fn unary(&mut self, op: UnaryOp, input: NodeId) -> NodeId {
         assert!(input < self.nodes.len());
 
+        // 1) 常量折叠
         if let Some(value) = self.constant_value(input) {
             let result = match op {
                 UnaryOp::Neg => -value,
@@ -239,17 +317,34 @@ impl GraphBuilder {
             return self.constant(result);
         }
 
-        // -(-x) => x
-        if op == UnaryOp::Neg {
-            if let NodeKind::Unary {
-                op: UnaryOp::Neg,
-                input: inner,
-            } = &self.nodes[input].kind
-            {
-                return *inner;
+        // 2) 代数恒等式
+        match op {
+            UnaryOp::Neg => {
+                // -(-x) => x
+                if let Some(inner) = self.neg_inner(input) {
+                    return inner;
+                }
             }
+
+            UnaryOp::Abs => {
+                // ||x|| => |x|
+                if let NodeKind::Unary {
+                    op: UnaryOp::Abs, ..
+                } = &self.nodes[input].kind
+                {
+                    return input;
+                }
+
+                // |-x| => |x|
+                if let Some(inner) = self.neg_inner(input) {
+                    return self.unary(UnaryOp::Abs, inner);
+                }
+            }
+
+            _ => {}
         }
 
+        // 3) CSE
         let key = NodeKey::Unary { op, input };
 
         if let Some(&id) = self.expressions.get(&key) {
@@ -270,6 +365,7 @@ impl GraphBuilder {
         let lhs_value = self.constant_value(lhs);
         let rhs_value = self.constant_value(rhs);
 
+        // 1) 常量折叠
         if let (Some(a), Some(b)) = (lhs_value, rhs_value) {
             let result = match op {
                 BinaryOp::Add => a + b,
@@ -286,6 +382,7 @@ impl GraphBuilder {
             return self.constant(result);
         }
 
+        // 2) 代数恒等式 / 强度削减
         match op {
             BinaryOp::Add => {
                 if rhs_value == Some(0.0) {
@@ -295,11 +392,42 @@ impl GraphBuilder {
                 if lhs_value == Some(0.0) {
                     return rhs;
                 }
+
+                // x + (-y) => x - y
+                if let Some(inner) = self.neg_inner(rhs) {
+                    return self.binary(BinaryOp::Sub, lhs, inner);
+                }
+
+                // (-x) + y => y - x
+                if let Some(inner) = self.neg_inner(lhs) {
+                    return self.binary(BinaryOp::Sub, rhs, inner);
+                }
+
+                // x + x => 2 * x
+                if lhs == rhs {
+                    let two = self.constant(2.0);
+                    return self.binary(BinaryOp::Mul, two, lhs);
+                }
             }
 
             BinaryOp::Sub => {
                 if rhs_value == Some(0.0) {
                     return lhs;
+                }
+
+                // x - (-y) => x + y
+                if let Some(inner) = self.neg_inner(rhs) {
+                    return self.binary(BinaryOp::Add, lhs, inner);
+                }
+
+                // 0 - x => -x
+                if lhs_value == Some(0.0) {
+                    return self.unary(UnaryOp::Neg, rhs);
+                }
+
+                // x - x => 0
+                if lhs == rhs {
+                    return self.constant(0.0);
                 }
             }
 
@@ -311,11 +439,59 @@ impl GraphBuilder {
                 if lhs_value == Some(1.0) {
                     return rhs;
                 }
+
+                // x * 0 => 0,  0 * x => 0
+                if rhs_value == Some(0.0) || lhs_value == Some(0.0) {
+                    return self.constant(0.0);
+                }
+
+                // x * (-1) => -x,  (-1) * x => -x
+                if rhs_value == Some(-1.0) {
+                    return self.unary(UnaryOp::Neg, lhs);
+                }
+
+                if lhs_value == Some(-1.0) {
+                    return self.unary(UnaryOp::Neg, rhs);
+                }
+
+                // (-x) * (-y) => x * y
+                if let (Some(l_inner), Some(r_inner)) = (self.neg_inner(lhs), self.neg_inner(rhs)) {
+                    return self.binary(BinaryOp::Mul, l_inner, r_inner);
+                }
+
+                // (-x) * y => -(x * y)
+                if let Some(l_inner) = self.neg_inner(lhs) {
+                    let prod = self.binary(BinaryOp::Mul, l_inner, rhs);
+                    return self.unary(UnaryOp::Neg, prod);
+                }
+
+                // x * (-y) => -(x * y)
+                if let Some(r_inner) = self.neg_inner(rhs) {
+                    let prod = self.binary(BinaryOp::Mul, lhs, r_inner);
+                    return self.unary(UnaryOp::Neg, prod);
+                }
             }
 
             BinaryOp::Div => {
                 if rhs_value == Some(1.0) {
                     return lhs;
+                }
+
+                // (-x) / (-y) => x / y
+                if let (Some(l_inner), Some(r_inner)) = (self.neg_inner(lhs), self.neg_inner(rhs)) {
+                    return self.binary(BinaryOp::Div, l_inner, r_inner);
+                }
+
+                // (-x) / y => -(x / y)
+                if let Some(l_inner) = self.neg_inner(lhs) {
+                    let q = self.binary(BinaryOp::Div, l_inner, rhs);
+                    return self.unary(UnaryOp::Neg, q);
+                }
+
+                // x / (-y) => -(x / y)
+                if let Some(r_inner) = self.neg_inner(rhs) {
+                    let q = self.binary(BinaryOp::Div, lhs, r_inner);
+                    return self.unary(UnaryOp::Neg, q);
                 }
             }
 
@@ -323,11 +499,39 @@ impl GraphBuilder {
                 if rhs_value == Some(1.0) {
                     return lhs;
                 }
+
+                // x^0 => 1
+                if rhs_value == Some(0.0) {
+                    return self.constant(1.0);
+                }
+
+                // 1^x => 1
+                if lhs_value == Some(1.0) {
+                    return self.constant(1.0);
+                }
+
+                // 强度削减
+                // x^2 => x * x
+                if rhs_value == Some(2.0) {
+                    return self.binary(BinaryOp::Mul, lhs, lhs);
+                }
+
+                // x^0.5 => sqrt(x)
+                if rhs_value == Some(0.5) {
+                    return self.unary(UnaryOp::Sqrt, lhs);
+                }
+
+                // x^3 => (x * x) * x
+                if rhs_value == Some(3.0) {
+                    let sq = self.binary(BinaryOp::Mul, lhs, lhs);
+                    return self.binary(BinaryOp::Mul, sq, lhs);
+                }
             }
 
             _ => {}
         }
 
+        // 3) 交换律规范化 + CSE
         let (key_lhs, key_rhs) = match op {
             BinaryOp::Add | BinaryOp::Mul | BinaryOp::Min | BinaryOp::Max => {
                 if lhs <= rhs {
@@ -364,6 +568,7 @@ impl GraphBuilder {
             nodes: self.nodes,
             root,
         }
+        .eliminate_dead_nodes()
     }
 }
 

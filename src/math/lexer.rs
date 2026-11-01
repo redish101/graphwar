@@ -1,6 +1,6 @@
 use std::fmt;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TokenType {
     // Literals
     Number(f64),
@@ -19,13 +19,14 @@ pub enum TokenType {
     // Delimiters
     LeftParen,
     RightParen,
+    AbsoluteValue,
     Comma,
 
     // End of input
     EOF,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub token_type: TokenType,
 
@@ -39,7 +40,7 @@ pub struct Lexer<'a> {
     current_char: Option<char>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LexError {
     /// 遇到了无法识别的字符
     UnexpectedCharacter { ch: char, position: usize },
@@ -176,6 +177,10 @@ impl<'a> Lexer<'a> {
                 ')' => {
                     self.advance();
                     TokenType::RightParen
+                }
+                '|' => {
+                    self.advance();
+                    TokenType::AbsoluteValue
                 }
                 ',' => {
                     self.advance();

@@ -102,6 +102,10 @@ impl Graph {
         self.nodes.get(id)
     }
 
+    pub fn count_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub fn dependencies(&self, id: NodeId) -> Option<Vec<NodeId>> {
         let node = self.node(id)?;
 
@@ -214,6 +218,91 @@ impl Graph {
             root: remap[root],
         }
     }
+
+    /// 单轮重写：按拓扑顺序用 **全新的** `GraphBuilder` 重建整张图。
+    /// 由于 builder 的 `unary` / `binary` 会应用全部代数规则、常量折叠和 CSE，
+    /// 这一轮就能把上一轮化简后暴露出来的新机会全部吃掉。
+    ///
+    /// 返回 `(新图, 是否有变化)`。
+    fn optimize_round(&self) -> (Graph, bool) {
+        let mut builder = GraphBuilder::new();
+        let mut remap: Vec<Option<NodeId>> = vec![None; self.nodes.len()];
+
+        // 由于 `eliminate_dead_nodes` 保留了旧 id 的相对顺序，
+        // 且原 `GraphBuilder` 的 append 顺序就是拓扑顺序（子先父后），
+        // 这里按 id 递增即可保证依赖已 remap。
+        for old_id in 0..self.nodes.len() {
+            let node = &self.nodes[old_id];
+
+            let new_id = match &node.kind {
+                NodeKind::Constant(value) => builder.constant(*value),
+                NodeKind::Variable(name) => builder.variable(name.clone()),
+
+                NodeKind::Unary { op, input } => {
+                    let input = remap[*input]
+                        .expect("topological order violated: unary input not remapped");
+                    builder.unary(*op, input)
+                }
+
+                NodeKind::Binary { op, lhs, rhs } => {
+                    let lhs =
+                        remap[*lhs].expect("topological order violated: binary lhs not remapped");
+                    let rhs =
+                        remap[*rhs].expect("topological order violated: binary rhs not remapped");
+                    builder.binary(*op, lhs, rhs)
+                }
+            };
+
+            remap[old_id] = Some(new_id);
+        }
+
+        let new_root = remap[self.root].expect("root must be remapped");
+
+        // 单轮 DCE，不递归 `finish`，避免无限递归。
+        let new_graph = builder.finish_round(new_root);
+
+        let changed = !graphs_equivalent(self, &new_graph);
+        (new_graph, changed)
+    }
+}
+
+/// 判断两个图在结构上是否完全等价（节点顺序、种类、引用 id 全部一致）。
+fn graphs_equivalent(a: &Graph, b: &Graph) -> bool {
+    if a.nodes.len() != b.nodes.len() || a.root != b.root {
+        return false;
+    }
+
+    a.nodes
+        .iter()
+        .zip(&b.nodes)
+        .all(|(na, nb)| na.id == nb.id && node_kind_eq(&na.kind, &nb.kind))
+}
+
+/// 对 `NodeKind` 做结构相等比较；`f64` 用 bit 比较以对 `NaN` 也稳定。
+fn node_kind_eq(a: &NodeKind, b: &NodeKind) -> bool {
+    match (a, b) {
+        (NodeKind::Constant(x), NodeKind::Constant(y)) => x.to_bits() == y.to_bits(),
+        (NodeKind::Variable(x), NodeKind::Variable(y)) => x == y,
+
+        (NodeKind::Unary { op: oa, input: ia }, NodeKind::Unary { op: ob, input: ib }) => {
+            oa == ob && ia == ib
+        }
+
+        (
+            NodeKind::Binary {
+                op: oa,
+                lhs: la,
+                rhs: ra,
+            },
+            NodeKind::Binary {
+                op: ob,
+                lhs: lb,
+                rhs: rb,
+            },
+        ) => oa == ob && la == lb && ra == rb,
+
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -283,6 +372,42 @@ impl GraphBuilder {
         }
     }
 
+    /// 如果 `id` 是 `Add(x, y)`，返回 `Some((x, y))`。
+    fn add_parts(&self, id: NodeId) -> Option<(NodeId, NodeId)> {
+        match &self.nodes.get(id)?.kind {
+            NodeKind::Binary {
+                op: BinaryOp::Add,
+                lhs,
+                rhs,
+            } => Some((*lhs, *rhs)),
+            _ => None,
+        }
+    }
+
+    /// 如果 `id` 是 `Sub(x, y)`，返回 `Some((x, y))`。
+    fn sub_parts(&self, id: NodeId) -> Option<(NodeId, NodeId)> {
+        match &self.nodes.get(id)?.kind {
+            NodeKind::Binary {
+                op: BinaryOp::Sub,
+                lhs,
+                rhs,
+            } => Some((*lhs, *rhs)),
+            _ => None,
+        }
+    }
+
+    /// 如果 `id` 是 `Mul(x, y)`，返回 `Some((x, y))`。
+    fn mul_parts(&self, id: NodeId) -> Option<(NodeId, NodeId)> {
+        match &self.nodes.get(id)?.kind {
+            NodeKind::Binary {
+                op: BinaryOp::Mul,
+                lhs,
+                rhs,
+            } => Some((*lhs, *rhs)),
+            _ => None,
+        }
+    }
+
     pub fn variable(&mut self, name: impl Into<String>) -> NodeId {
         let name = name.into();
 
@@ -323,6 +448,11 @@ impl GraphBuilder {
                 // -(-x) => x
                 if let Some(inner) = self.neg_inner(input) {
                     return inner;
+                }
+
+                // 新增：-(a - b) => b - a
+                if let Some((sub_l, sub_r)) = self.sub_parts(input) {
+                    return self.binary(BinaryOp::Sub, sub_r, sub_l);
                 }
             }
 
@@ -365,7 +495,6 @@ impl GraphBuilder {
         let lhs_value = self.constant_value(lhs);
         let rhs_value = self.constant_value(rhs);
 
-        // 1) 常量折叠
         if let (Some(a), Some(b)) = (lhs_value, rhs_value) {
             let result = match op {
                 BinaryOp::Add => a + b,
@@ -382,7 +511,6 @@ impl GraphBuilder {
             return self.constant(result);
         }
 
-        // 2) 代数恒等式 / 强度削减
         match op {
             BinaryOp::Add => {
                 if rhs_value == Some(0.0) {
@@ -408,6 +536,20 @@ impl GraphBuilder {
                     let two = self.constant(2.0);
                     return self.binary(BinaryOp::Mul, two, lhs);
                 }
+
+                // 新增：(a - b) + b => a
+                if let Some((sub_l, sub_r)) = self.sub_parts(lhs) {
+                    if sub_r == rhs {
+                        return sub_l;
+                    }
+                }
+
+                // b + (a - b) => a
+                if let Some((sub_l, sub_r)) = self.sub_parts(rhs) {
+                    if sub_r == lhs {
+                        return sub_l;
+                    }
+                }
             }
 
             BinaryOp::Sub => {
@@ -428,6 +570,24 @@ impl GraphBuilder {
                 // x - x => 0
                 if lhs == rhs {
                     return self.constant(0.0);
+                }
+
+                // (a + b) - b => a
+                // (a + b) - a => b
+                if let Some((add_l, add_r)) = self.add_parts(lhs) {
+                    if add_r == rhs {
+                        return add_l;
+                    }
+                    if add_l == rhs {
+                        return add_r;
+                    }
+                }
+
+                // a - (a - b) => b
+                if let Some((sub_l, sub_r)) = self.sub_parts(rhs) {
+                    if sub_l == lhs {
+                        return sub_r;
+                    }
                 }
             }
 
@@ -493,6 +653,20 @@ impl GraphBuilder {
                     let q = self.binary(BinaryOp::Div, lhs, r_inner);
                     return self.unary(UnaryOp::Neg, q);
                 }
+
+                // (a * k) / k => a
+                if let Some(k) = rhs_value {
+                    if k != 0.0 && k.is_finite() {
+                        if let Some((mul_l, mul_r)) = self.mul_parts(lhs) {
+                            if self.constant_value(mul_l) == Some(k) {
+                                return mul_r;
+                            }
+                            if self.constant_value(mul_r) == Some(k) {
+                                return mul_l;
+                            }
+                        }
+                    }
+                }
             }
 
             BinaryOp::Pow => {
@@ -510,7 +684,6 @@ impl GraphBuilder {
                     return self.constant(1.0);
                 }
 
-                // 强度削减
                 // x^2 => x * x
                 if rhs_value == Some(2.0) {
                     return self.binary(BinaryOp::Mul, lhs, lhs);
@@ -531,7 +704,6 @@ impl GraphBuilder {
             _ => {}
         }
 
-        // 3) 交换律规范化 + CSE
         let (key_lhs, key_rhs) = match op {
             BinaryOp::Add | BinaryOp::Mul | BinaryOp::Min | BinaryOp::Max => {
                 if lhs <= rhs {
@@ -561,14 +733,30 @@ impl GraphBuilder {
         id
     }
 
-    pub fn finish(self, root: NodeId) -> Graph {
-        assert!(root < self.nodes.len());
-
+    fn finish_round(self, root: NodeId) -> Graph {
         Graph {
             nodes: self.nodes,
             root,
         }
         .eliminate_dead_nodes()
+    }
+
+    pub fn finish(self, root: NodeId) -> Graph {
+        assert!(root < self.nodes.len());
+
+        let mut graph = self.finish_round(root);
+
+        const MAX_ROUNDS: usize = 32;
+
+        for _ in 0..MAX_ROUNDS {
+            let (new_graph, changed) = graph.optimize_round();
+            if !changed {
+                break;
+            }
+            graph = new_graph;
+        }
+
+        graph
     }
 }
 
